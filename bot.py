@@ -9,7 +9,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, Filter
 from aiogram.enums import ChatType
 from aiogram.types import ChatPermissions
-from aiogram.client.default import DefaultBotProperties # <-- CORRECTED IMPORT
+from aiogram.client.default import DefaultBotProperties 
 
 from fastapi import FastAPI
 import uvicorn
@@ -135,15 +135,14 @@ async def cmd_send(message: types.Message, bot: Bot):
 async def cmd_list(message: types.Message):
     """/list: Shows all Telegram users/mentions who participated."""
     chat_id = message.chat.id
-    participants_map, _, _, display_names_map, _ = get_session_data(chat_id)
+    participants_map, _, _, display_names_map, _ = get_session_data(chat_id) 
     
-    # We sort the values (the display names/mentions) alphabetically
-    sorted_users = sorted(display_names_map.values())
+    participating_user_ids = participants_map.keys()
+    sorted_users = sorted([display_names_map[uid] for uid in participating_user_ids if uid in display_names_map])
     
-    user_list = "\n".join(sorted_users)
-    response = "USERS PARTICIPATED ✅\n\n" + (user_list if user_list else "No users have participated yet.")
+    user_list = "\n• ".join(sorted_users)
+    response = "USERS PARTICIPATED ✅\n\n• " + (user_list if user_list else "No users have participated yet.")
     
-    # HTML is used to correctly render clickable mentions
     await message.reply(response, parse_mode="HTML") 
     logger.info(f"Admin {message.from_user.id} requested /list in chat {chat_id}.")
 
@@ -152,8 +151,8 @@ async def cmd_xlist(message: types.Message):
     chat_id = message.chat.id
     _, x_handles_map, _, _, _ = get_session_data(chat_id)
     
-    x_handle_list = "\n".join(sorted(x_handles_map.values()))
-    response = "ALL X ID'S WHO HAVE PARTICIPATED ✅\n\n" + (x_handle_list if x_handle_list else "No X handles found yet.")
+    x_handle_list = "\n• ".join(sorted(x_handles_map.values()))
+    response = "ALL X ID'S WHO HAVE PARTICIPATED ✅\n\n• " + (x_handle_list if x_handle_list else "No X handles found yet.")
     
     await message.reply(response)
     logger.info(f"Admin {message.from_user.id} requested /xlist in chat {chat_id}.")
@@ -168,8 +167,8 @@ async def cmd_adlist(message: types.Message):
         for user_id, status in completed_users_map.items() if status
     ]
     
-    user_list = "\n".join(sorted(completed_display_names))
-    response = "USERS WHO COMPLETED ENGAGEMENT ✅\n\n" + (user_list if user_list else "No users have completed engagement yet.")
+    user_list = "\n• ".join(sorted(completed_display_names))
+    response = "USERS WHO COMPLETED ENGAGEMENT ✅\n\n• " + (user_list if user_list else "No users have completed engagement yet.")
     
     await message.reply(response, parse_mode="HTML")
     logger.info(f"Admin {message.from_user.id} requested /adlist in chat {chat_id}.")
@@ -185,8 +184,8 @@ async def cmd_notad(message: types.Message):
     
     if not_completed_ids:
         not_completed_display_names = [display_names_map[user_id] for user_id in not_completed_ids]
-        user_list = "\n".join(sorted(not_completed_display_names))
-        response = "USERS WHO HAVE NOT COMPLETED ⚠️\n\n" + user_list
+        user_list = "\n• ".join(sorted(not_completed_display_names))
+        response = "USERS WHO HAVE NOT COMPLETED ⚠️\n\n• " + user_list
     else:
         response = "All users completed engagement ✅"
         
@@ -194,17 +193,18 @@ async def cmd_notad(message: types.Message):
     logger.info(f"Admin {message.from_user.id} requested /notad in chat {chat_id}.")
 
 async def cmd_refresh(message: types.Message, bot: Bot):
-    """/refresh: Cleans up data and deletes all messages."""
+    """/refresh: Cleans up data. NOTE: Full message deletion is not supported without storing message IDs."""
     chat_id = message.chat.id
     
     await message.reply("STARTING CLEANUP 🧹")
     
     clear_data(chat_id) 
     
-    # Placeholder for message deletion logic. (Render/aiogram don't support deleting ALL without IDs)
-    messages_deleted = 0 
+    # NOTE ON MESSAGE DELETION: 
+    # Telegram bot limitations prevent deleting all messages without storing their IDs.
+    # The in-memory session data is cleared, but message history remains in the chat.
     
-    await message.reply(f"Cleaned {messages_deleted} messages 🧽 (Data cleared successfully)") 
+    await message.reply(f"Data cleared successfully 🧽 (Message history remains in chat)") 
     logger.info(f"Admin {message.from_user.id} finished /refresh in chat {chat_id}. Data reset.")
 
 async def cmd_lock(message: types.Message, bot: Bot):
@@ -293,7 +293,8 @@ async def handle_user_messages(message: types.Message):
     if user_text.lower() in ad_keywords:
         
         recorded_link = participants_map.get(user_id)
-        user_mention = display_names_map.get(user_id, f"User {user_id}") 
+        # Use the stored display name for consistency
+        user_mention = display_names_map.get(user_id, get_user_mention(message.from_user)) 
         
         if not recorded_link:
             await message.reply("Your link hasn't been recorded yet. Please send your X link first.")
@@ -301,10 +302,10 @@ async def handle_user_messages(message: types.Message):
 
         completed_users_map[user_id] = True
         
-        # Format the response exactly as in the example
+        # Format the response to show the user's X link, fulfilling the user request
         response = (
             f"ENGAGEMENT RECORDED 👍 for {user_mention}\n"
-            f"Their X link:\n{recorded_link}"
+            f"Their X link:\n{recorded_link}" # This is the full X link they sent
         )
         await message.reply(response, parse_mode="HTML") 
         logger.info(f"AD/Done recorded for {user_id} in chat {chat_id}.")
@@ -320,7 +321,8 @@ async def handle_user_messages(message: types.Message):
             return
             
         if user_id in participants_map:
-            await message.reply("You have already shared a link this session.")
+            # Current implementation only allows 1 link per user per session for simplicity
+            await message.reply("You have already shared a link this session. Maximum 1 link per session allowed.")
             return
             
         x_username = extract_x_username(user_text)
@@ -330,10 +332,11 @@ async def handle_user_messages(message: types.Message):
             return
             
         # Store the data
-        participants_map[user_id] = user_text
-        x_handles_map[user_id] = x_username
+        participants_map[user_id] = user_text # Store the full link
+        x_handles_map[user_id] = x_username   # Store the extracted username
         completed_users_map[user_id] = False 
-        display_names_map[user_id] = get_user_mention(message.from_user) # Store the HTML mention string
+        # Store the HTML mention string immediately upon link submission
+        display_names_map[user_id] = get_user_mention(message.from_user) 
         
         # User feedback for recorded link (as per example flow)
         user_mention = get_user_mention(message.from_user)
