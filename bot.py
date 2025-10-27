@@ -9,6 +9,7 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, Filter
 from aiogram.enums import ChatType
 from aiogram.types import ChatPermissions
+from aiogram.client.default import DefaultBotProperties # <-- CORRECTED IMPORT
 
 from fastapi import FastAPI
 import uvicorn
@@ -60,7 +61,8 @@ def get_user_mention(user: types.User) -> str:
     
     # Fallback to a clickable mention using HTML
     name = user.full_name or "Participant"
-    return f'<a href="tg://user?id={user.id}">{name}</a>'
+    # Using HTML <a> tag for a clickable mention
+    return f'<a href="tg://user?id={user.id}">{name}</a>' 
 
 async def is_admin(chat_id: int, user_id: int, bot: Bot) -> bool:
     """Checks if a user is an admin in the specified chat."""
@@ -135,6 +137,7 @@ async def cmd_list(message: types.Message):
     chat_id = message.chat.id
     participants_map, _, _, display_names_map, _ = get_session_data(chat_id)
     
+    # We sort the values (the display names/mentions) alphabetically
     sorted_users = sorted(display_names_map.values())
     
     user_list = "\n".join(sorted_users)
@@ -188,7 +191,7 @@ async def cmd_notad(message: types.Message):
         response = "All users completed engagement ✅"
         
     await message.reply(response, parse_mode="HTML")
-    logger.info(f"Admin {message.from_user.id} requested /notad in chat {chat_id}. {len(not_completed_ids)} incomplete.")
+    logger.info(f"Admin {message.from_user.id} requested /notad in chat {chat_id}.")
 
 async def cmd_refresh(message: types.Message, bot: Bot):
     """/refresh: Cleans up data and deletes all messages."""
@@ -198,7 +201,7 @@ async def cmd_refresh(message: types.Message, bot: Bot):
     
     clear_data(chat_id) 
     
-    # Placeholder for message deletion logic.
+    # Placeholder for message deletion logic. (Render/aiogram don't support deleting ALL without IDs)
     messages_deleted = 0 
     
     await message.reply(f"Cleaned {messages_deleted} messages 🧽 (Data cleared successfully)") 
@@ -239,7 +242,7 @@ async def cmd_rs(message: types.Message):
     
     # Using MarkdownV2 for bold/italic text
     rules = (
-        "📜 *SOCIALFI ADDA 👁‍🗨 — Group Rules & How It Works*\n\n"
+        "📜 *SOCIALFI ADDA 👁‍🗨 — Group Rules \\& How It Works*\n\n"
         "🔹 *Sessions \\& Timing:*\n"
         "• 2 sessions daily\\.\n"
         "👉 *1st Session:* 9:00 AM – 3:00 PM\n"
@@ -365,7 +368,7 @@ def setup_bot_handlers(dp: Dispatcher, admin_filter: GroupAdminFilter):
     dp.message.register(cmd_notad, Command("notad"), admin_filter)
     dp.message.register(cmd_refresh, Command("refresh"), admin_filter)
     dp.message.register(cmd_lock, Command("lock"), admin_filter)
-    dp.message.register(cmd_stop, Command("stop"), admin_filter) # New /stop command
+    dp.message.register(cmd_stop, Command("stop"), admin_filter)
     dp.message.register(cmd_rs, Command("rs"), admin_filter)
     dp.message.register(cmd_detect, Command("detect"), admin_filter)
     
@@ -407,8 +410,11 @@ async def run_webserver():
 async def main():
     """The main entry point for the bot and webserver."""
     
-    # Set default parse_mode to HTML for correct rendering of mentions
-    bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+    # CORRECTED: Bot initialization using DefaultBotProperties as required by aiogram 3.7.0+
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode="HTML")
+    )
     dp = Dispatcher()
     
     admin_filter = GroupAdminFilter()
