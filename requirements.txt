@@ -1,0 +1,25 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# SOCIALFI ADDA 👁‍🗨 TELEGRAM BOT - DEPENDENCIES
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Install with: pip install -r requirements.txt
+#
+# For Render deployment:
+# - Build Command: pip install -r requirements.txt
+# - Start Command: python bot.py
+#
+
+# Telegram Bot Framework (Async)
+aiogram==3.4.1
+
+# Async SQLite Database
+aiosqlite==0.19.0
+
+# HTTP Client (dependency of aiogram, but specified for clarity)
+aiohttp==3.9.3
+
+# Magic Filter (dependency of aiogram)
+magic-filter==1.0.12
+
+# Additional stability dependencies
+certifi==2024.2.2
