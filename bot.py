@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import re
-from typing import Dict, Any, Optional, Union
+from typing import Dict, Any, Optional, Union, List
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
@@ -34,16 +34,21 @@ logger = logging.getLogger(__name__)
 # --- In-Memory Data Storage (Keyed by Chat ID) ---
 # We use user_id (int) as the unique identifier within each chat's session data.
 
-# chat_id -> (user_id -> X link)
-participants: Dict[int, Dict[int, str]] = {}
+# chat_id -> (user_id -> List of X links)
+participants: Dict[int, Dict[int, List[str]]] = {} # CHANGED to store a LIST of links
 # chat_id -> (user_id -> X Username)
 x_handles: Dict[int, Dict[int, str]] = {}
 # chat_id -> (user_id -> Completion Status: bool)
 completed_users: Dict[int, Dict[int, bool]] = {}
 # chat_id -> (user_id -> Display Name/Mention String (HTML format))
 display_names: Dict[int, Dict[int, str]] = {}
-# chat_id -> chat_is_locked (bool)
-chat_locks: Dict[int, bool] = {}
+# chat_id -> chat_is_active (bool): True = /send, False = /stop
+session_active: Dict[int, bool] = {} # NEW: Tracks if the bot should process links/ADs
+# chat_id -> chat_is_locked (bool): True = chat is muted
+chat_locks: Dict[int, bool] = {} 
+
+# Link Limit Constant
+MAX_LINKS_PER_USER = 2
 
 # Regex to extract X (formerly Twitter) username from a link
 X_LINK_REGEX = re.compile(r"https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\/([a-zA-Z0-9_]+)\/status\/\d+")
@@ -82,14 +87,24 @@ def is_x_link(text: str) -> bool:
     """Simple check for common X link patterns."""
     return bool(re.search(r"https?:\/\/(?:x\.com|twitter\.com)\/", text))
 
-def get_session_data(chat_id: int) -> tuple[Dict[int, str], Dict[int, str], Dict[int, bool], Dict[int, str], bool]:
+def get_session_data(chat_id: int) -> tuple[Dict[int, List[str]], Dict[int, str], Dict[int, bool], Dict[int, str], bool, bool]:
     """Initializes and retrieves session data for a given chat."""
     participants_map = participants.setdefault(chat_id, {})
     x_handles_map = x_handles.setdefault(chat_id, {})
     completed_users_map = completed_users.setdefault(chat_id, {})
     display_names_map = display_names.setdefault(chat_id, {})
-    is_locked = chat_locks.get(chat_id, False)
-    return participants_map, x_handles_map, completed_users_map, display_names_map, is_locked
+    
+    # Ensure all maps are correctly set up for the chat
+    participants.setdefault(chat_id, {})
+    x_handles.setdefault(chat_id, {})
+    completed_users.setdefault(chat_id, {})
+    display_names.setdefault(chat_id, {})
+    
+    # NEW/CHANGED: Get the state of session activity and chat lock
+    is_active = session_active.get(chat_id, True) # Default to active
+    is_locked = chat_locks.get(chat_id, False) 
+    
+    return participants_map, x_handles_map, completed_users_map, display_names_map, is_active, is_locked
 
 def clear_data(chat_id: int) -> None:
     """Clears all in-memory data for a new session in a specific chat."""
@@ -97,7 +112,9 @@ def clear_data(chat_id: int) -> None:
     x_handles.pop(chat_id, None)
     completed_users.pop(chat_id, None)
     display_names.pop(chat_id, None)
-    chat_locks[chat_id] = False
+    
+    # IMPORTANT: Do not change chat_locks state here. That is controlled by /lock and /unlock
+    
     logger.info(f"In-memory bot data cleared for chat {chat_id}.")
 
 # --- Filter for Admin and Group Check ---
@@ -118,27 +135,27 @@ class GroupAdminFilter(Filter):
 # --- Handlers for Admin Commands ---
 
 async def cmd_send(message: types.Message, bot: Bot):
-    """/send: Unlocks chat and starts a new session."""
+    """/send: Activates the bot session and clears data."""
     chat_id = message.chat.id
     
     clear_data(chat_id) 
+    session_active[chat_id] = True # Set session to active
     
-    await bot.set_chat_permissions(
-        chat_id=chat_id,
-        permissions=ChatPermissions(can_send_messages=True)
-    )
-    chat_locks[chat_id] = False
+    # Note: /send should NOT unlock the chat. That is handled by /unlock (or if you prefer, keep it locked)
+    # Removing permission change here, unless you explicitly want /send to unlock the chat.
+    # If the chat is locked, admins must use /unlock first.
     
     await message.reply("START SENDING LINK 🔗")
-    logger.info(f"Admin {message.from_user.id} started a new session in chat {chat_id} with /send.")
+    logger.info(f"Admin {message.from_user.id} activated session in chat {chat_id} with /send.")
 
 async def cmd_list(message: types.Message):
     """/list: Shows all Telegram users/mentions who participated."""
     chat_id = message.chat.id
-    participants_map, _, _, display_names_map, _ = get_session_data(chat_id) 
+    participants_map, _, _, display_names_map, _, _ = get_session_data(chat_id) 
     
+    # We iterate over the keys in participants_map to find everyone who submitted a link
     participating_user_ids = participants_map.keys()
-    sorted_users = sorted([display_names_map[uid] for uid in participating_user_ids if uid in display_names_map])
+    sorted_users = sorted([display_names_map.get(uid) for uid in participating_user_ids if uid in display_names_map])
     
     user_list = "\n• ".join(sorted_users)
     response = "USERS PARTICIPATED ✅\n\n• " + (user_list if user_list else "No users have participated yet.")
@@ -149,7 +166,7 @@ async def cmd_list(message: types.Message):
 async def cmd_xlist(message: types.Message):
     """/xlist: Shows all extracted X usernames."""
     chat_id = message.chat.id
-    _, x_handles_map, _, _, _ = get_session_data(chat_id)
+    _, x_handles_map, _, _, _, _ = get_session_data(chat_id)
     
     x_handle_list = "\n• ".join(sorted(x_handles_map.values()))
     response = "ALL X ID'S WHO HAVE PARTICIPATED ✅\n\n• " + (x_handle_list if x_handle_list else "No X handles found yet.")
@@ -160,7 +177,7 @@ async def cmd_xlist(message: types.Message):
 async def cmd_adlist(message: types.Message):
     """/adlist: Lists Telegram users/mentions who completed engagement."""
     chat_id = message.chat.id
-    _, _, completed_users_map, display_names_map, _ = get_session_data(chat_id)
+    _, _, completed_users_map, display_names_map, _, _ = get_session_data(chat_id)
     
     completed_display_names = [
         display_names_map[user_id] 
@@ -176,7 +193,7 @@ async def cmd_adlist(message: types.Message):
 async def cmd_notad(message: types.Message):
     """/notad: Finds users who haven't completed engagement."""
     chat_id = message.chat.id
-    participants_map, _, completed_users_map, display_names_map, _ = get_session_data(chat_id)
+    participants_map, _, completed_users_map, display_names_map, _, _ = get_session_data(chat_id)
     
     all_participants_ids = set(participants_map.keys())
     completed_ids = {user_id for user_id, status in completed_users_map.items() if status}
@@ -199,42 +216,65 @@ async def cmd_refresh(message: types.Message, bot: Bot):
     await message.reply("STARTING CLEANUP 🧹")
     
     clear_data(chat_id) 
+    session_active[chat_id] = False # Set session to inactive (idle)
     
-    # NOTE ON MESSAGE DELETION: 
-    # Telegram bot limitations prevent deleting all messages without storing their IDs.
-    # The in-memory session data is cleared, but message history remains in the chat.
-    
-    await message.reply(f"Data cleared successfully 🧽 (Message history remains in chat)") 
-    logger.info(f"Admin {message.from_user.id} finished /refresh in chat {chat_id}. Data reset.")
+    await message.reply(f"Data cleared successfully, bot is now idle 🧽") 
+    logger.info(f"Admin {message.from_user.id} finished /refresh in chat {chat_id}. Data reset and bot idled.")
 
 async def cmd_lock(message: types.Message, bot: Bot):
-    """/lock: Locks the chat."""
-    chat_id = message.chat.id
-    
-    await bot.set_chat_permissions(
-        chat_id=chat_id,
-        permissions=ChatPermissions(can_send_messages=False)
-    )
-    chat_locks[chat_id] = True
-    
-    await message.reply("Group chat locked 🔒")
-    logger.info(f"Admin {message.from_user.id} locked chat {chat_id} via /lock.")
-
-async def cmd_stop(message: types.Message, bot: Bot):
-    """/stop: Locks the chat (identical to /lock)."""
+    """/lock: Locks the group chat (prevents all non-admin messages/media)."""
     chat_id = message.chat.id
     
     await bot.set_chat_permissions(
         chat_id=chat_id,
         permissions=ChatPermissions(
             can_send_messages=False, 
-            can_send_media_messages=False 
+            can_send_media_messages=False,
+            can_send_polls=False,
+            can_send_other_messages=False,
+            can_add_web_page_previews=False,
+            can_change_info=False,
+            can_invite_users=False,
+            can_pin_messages=False
         )
     )
     chat_locks[chat_id] = True
     
-    await message.reply("Group chat locked 🔒")
-    logger.info(f"Admin {message.from_user.id} locked chat {chat_id} via /stop.")
+    await message.reply("Group chat locked 🔒. Only admins can send messages.")
+    logger.info(f"Admin {message.from_user.id} locked chat {chat_id} via /lock.")
+
+async def cmd_unlock(message: types.Message, bot: Bot):
+    """/unlock: Unlocks the group chat (allows all members to send messages/media)."""
+    chat_id = message.chat.id
+    
+    await bot.set_chat_permissions(
+        chat_id=chat_id,
+        permissions=ChatPermissions(
+            can_send_messages=True, 
+            can_send_media_messages=True,
+            can_send_polls=True,
+            can_send_other_messages=True,
+            can_add_web_page_previews=True,
+            can_change_info=True,
+            can_invite_users=True,
+            can_pin_messages=True
+        )
+    )
+    chat_locks[chat_id] = False
+    
+    await message.reply("Group chat unlocked 🔓.")
+    logger.info(f"Admin {message.from_user.id} unlocked chat {chat_id} via /unlock.")
+
+
+async def cmd_stop(message: types.Message, bot: Bot):
+    """/stop: Sets the bot session to inactive (idle state) but does NOT lock the chat."""
+    chat_id = message.chat.id
+    
+    clear_data(chat_id)
+    session_active[chat_id] = False # Set session to inactive (idle)
+    
+    await message.reply("Bot session stopped (IDLE). It will not record links or ADs until /send is used.")
+    logger.info(f"Admin {message.from_user.id} idled the bot session in chat {chat_id} via /stop.")
 
 
 async def cmd_rs(message: types.Message):
@@ -251,8 +291,8 @@ async def cmd_rs(message: types.Message):
         "👉 *2nd Session:* 6:00 PM – 8:00 PM IST\n"
         "✅ *Engagement :* 8:00 PM - 10:00 PM IST\n"
         "➡️ *Admin Check:* 10:00 PM – 11:00 PM\n\n"
-        "🔹 *Link Sharing:*\n"
-        "• Each user can send 2 links per session only\\.\n\n"
+        f"🔹 *Link Sharing:*\n"
+        f"• Each user can send {MAX_LINKS_PER_USER} links per session only\\.\n\n"
         "🔹 *Engagement Rule:*\n"
         "• Engage with all links shared in GC\\.\n"
         "• After engaging, react on each link\\.\n"
@@ -285,27 +325,35 @@ async def handle_user_messages(message: types.Message):
     user_id = message.from_user.id
     user_text = message.text.strip()
     
-    # Get session data for this specific chat
-    participants_map, x_handles_map, completed_users_map, display_names_map, chat_is_locked = get_session_data(chat_id)
+    # Get session data
+    participants_map, x_handles_map, completed_users_map, display_names_map, session_is_active, chat_is_locked = get_session_data(chat_id)
 
     # 1. Handle "AD/Done" messages
     ad_keywords = {"ad", "done", "all done", "completed"}
     if user_text.lower() in ad_keywords:
         
-        recorded_link = participants_map.get(user_id)
-        # Use the stored display name for consistency
-        user_mention = display_names_map.get(user_id, get_user_mention(message.from_user)) 
-        
-        if not recorded_link:
+        if not session_is_active:
+            # Bot is idle, ignore AD
+            return
+
+        recorded_links = participants_map.get(user_id) # Now retrieves a list of links
+        # We need at least one link to record completion
+        if not recorded_links:
             await message.reply("Your link hasn't been recorded yet. Please send your X link first.")
             return
 
         completed_users_map[user_id] = True
         
-        # Format the response to show the user's X link, fulfilling the user request
+        # Use the stored display name for consistency
+        user_mention = display_names_map.get(user_id, get_user_mention(message.from_user))
+        
+        # We use the *first* link for the AD response, or the most recent one if preferred.
+        last_recorded_link = recorded_links[-1] 
+        
+        # Format the response to show the user's X link
         response = (
             f"ENGAGEMENT RECORDED 👍 for {user_mention}\n"
-            f"Their X link:\n{recorded_link}" # This is the full X link they sent
+            f"Their X link:\n{last_recorded_link}" 
         )
         await message.reply(response, parse_mode="HTML") 
         logger.info(f"AD/Done recorded for {user_id} in chat {chat_id}.")
@@ -313,6 +361,8 @@ async def handle_user_messages(message: types.Message):
 
     # 2. Handle Link Sharing
     if is_x_link(user_text):
+        
+        # If chat is locked, delete message immediately (only admin messages are allowed)
         if chat_is_locked:
             try:
                 await message.delete()
@@ -320,9 +370,20 @@ async def handle_user_messages(message: types.Message):
                 pass
             return
             
-        if user_id in participants_map:
-            # Current implementation only allows 1 link per user per session for simplicity
-            await message.reply("You have already shared a link this session. Maximum 1 link per session allowed.")
+        # If session is inactive (idle), links are not processed
+        if not session_is_active:
+             await message.reply("The bot session is currently idle. Please wait for an admin to start a new session with /send.")
+             return
+            
+        # Check link limit 
+        user_links = participants_map.setdefault(user_id, [])
+        if len(user_links) >= MAX_LINKS_PER_USER:
+            # FIX: User has sent too many links. Just delete the message and return silently.
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            # Optional: You can send a private message to the user about the limit if allowed by Telegram rules.
             return
             
         x_username = extract_x_username(user_text)
@@ -332,17 +393,22 @@ async def handle_user_messages(message: types.Message):
             return
             
         # Store the data
-        participants_map[user_id] = user_text # Store the full link
-        x_handles_map[user_id] = x_username   # Store the extracted username
+        user_links.append(user_text)
+        # We only need to store the X handle once per user per session for the /xlist
+        if user_id not in x_handles_map:
+            x_handles_map[user_id] = x_username
+        
         completed_users_map[user_id] = False 
+        
         # Store the HTML mention string immediately upon link submission
         display_names_map[user_id] = get_user_mention(message.from_user) 
         
-        # User feedback for recorded link (as per example flow)
+        # User feedback for recorded link 
         user_mention = get_user_mention(message.from_user)
-        await message.reply(f"✅ Link from {user_mention} recorded ({x_username})", parse_mode="HTML")
+        link_count = len(user_links)
+        await message.reply(f"✅ Link {link_count}/{MAX_LINKS_PER_USER} from {user_mention} recorded ({x_username})", parse_mode="HTML")
 
-        logger.info(f"Link received from {user_id} in chat {chat_id}. X Handle: {x_username}.")
+        logger.info(f"Link {link_count} received from {user_id} in chat {chat_id}. X Handle: {x_username}.")
         
     else:
         # Regular chat message: delete if locked
@@ -370,7 +436,8 @@ def setup_bot_handlers(dp: Dispatcher, admin_filter: GroupAdminFilter):
     dp.message.register(cmd_adlist, Command("adlist"), admin_filter)
     dp.message.register(cmd_notad, Command("notad"), admin_filter)
     dp.message.register(cmd_refresh, Command("refresh"), admin_filter)
-    dp.message.register(cmd_lock, Command("lock"), admin_filter)
+    dp.message.register(cmd_lock, Command("lock"), admin_filter) # NEW lock command
+    dp.message.register(cmd_unlock, Command("unlock"), admin_filter) # Added unlock for completeness
     dp.message.register(cmd_stop, Command("stop"), admin_filter)
     dp.message.register(cmd_rs, Command("rs"), admin_filter)
     dp.message.register(cmd_detect, Command("detect"), admin_filter)
