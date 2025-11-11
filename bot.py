@@ -4,17 +4,19 @@ import os
 import re
 from typing import Dict, Any, Optional, Union, List
 import sys 
+import json # Required for handling Webhook update data
 
 # Dependencies from requirements.txt
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command, Filter
 from aiogram.enums import ChatType
-from aiogram.types import ChatPermissions
+from aiogram.types import ChatPermissions, Update
 from aiogram.client.default import DefaultBotProperties 
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Response, Request
 import uvicorn
+from starlette.responses import HTMLResponse
 
 # --- 🧠 General Setup ---
 
@@ -22,9 +24,20 @@ load_dotenv()
 
 # Configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+RENDER_URL = os.getenv("RENDER_EXTERNAL_URL") # Render automatically sets this
+if not RENDER_URL:
+    logging.getLogger(__name__).critical("RENDER_EXTERNAL_URL not found. Exiting.")
+    # For local testing, you might set this manually: RENDER_URL = "http://localhost:8080"
+    sys.exit(1)
 if not BOT_TOKEN:
     logging.getLogger(__name__).critical("BOT_TOKEN not found. Exiting.")
     sys.exit(1)
+
+# Webhook Configuration
+WEB_SERVER_HOST = "0.0.0.0"
+WEB_SERVER_PORT = int(os.getenv("PORT", 8080))
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_PATH}"
 
 # Logging setup
 logging.basicConfig(
@@ -45,7 +58,7 @@ chat_locks: Dict[int, bool] = {}
 MAX_LINKS_PER_USER = 2
 X_LINK_REGEX = re.compile(r"https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\/([a-zA-Z0-9_]+)\/status\/\d+")
 
-# --- Core Helper Functions ---
+# --- Core Helper Functions and Filters (Unchanged for stability) ---
 
 def get_user_mention(user: types.User) -> str:
     """Creates a clickable HTML mention for a user."""
@@ -96,11 +109,8 @@ def clear_data(chat_id: int) -> int:
     logger.info(f"In-memory bot data cleared for chat {chat_id}. {links_to_clear} links cleared.")
     return links_to_clear
 
-# --- Filter for Admin and Group Check ---
-
 class GroupAdminFilter(Filter):
     """Filter that only allows messages from admins of the current group/supergroup chat."""
-    
     async def __call__(self, message: types.Message, bot: Bot) -> bool:
         if message.chat.type not in [ChatType.GROUP, ChatType.SUPERGROUP]:
             return False
@@ -110,7 +120,7 @@ class GroupAdminFilter(Filter):
         
         return False
 
-# --- Handlers for Admin Commands ---
+# --- Handlers for Admin Commands (Minimal replies, high stability) ---
 
 async def cmd_send(message: types.Message):
     """/send: Activates the bot session and clears data, replies in 3-4 words."""
@@ -124,7 +134,7 @@ async def cmd_send(message: types.Message):
     logger.info(f"Admin {message.from_user.id} activated session in chat {chat_id} with /send.")
 
 async def cmd_refresh(message: types.Message):
-    """/refresh: Cleans up data and sets the bot to idle, and reports progress."""
+    """/refresh: Cleans up data, sets the bot to idle, and reports progress."""
     chat_id = message.chat.id
     
     # 1. Immediate Reply
@@ -146,11 +156,10 @@ async def cmd_list(message: types.Message):
     participating_user_ids = participants_map.keys()
     sorted_users = sorted([display_names_map.get(uid) for uid in participating_user_ids if uid in display_names_map])
     
-    user_list = "\n• ".join(sorted_users)
+    user_list = "\n• ".join(sorted(sorted_users))
     response = "USERS PARTICIPATED ✅\n\n• " + (user_list if user_list else "No users have participated yet. ⏳")
     
     await message.reply(response, parse_mode="HTML") 
-    logger.info(f"Admin {message.from_user.id} requested /list in chat {chat_id}.")
 
 async def cmd_xlist(message: types.Message):
     """/xlist: Shows all extracted X usernames."""
@@ -161,7 +170,6 @@ async def cmd_xlist(message: types.Message):
     response = "ALL X ID'S WHO HAVE PARTICIPATED ✅\n\n• " + (x_handle_list if x_handle_list else "No X handles found yet. ⏳")
     
     await message.reply(response)
-    logger.info(f"Admin {message.from_user.id} requested /xlist in chat {chat_id}.")
 
 async def cmd_adlist(message: types.Message):
     """/adlist: Lists Telegram users/mentions who completed engagement."""
@@ -177,7 +185,6 @@ async def cmd_adlist(message: types.Message):
     response = "USERS WHO COMPLETED ENGAGEMENT ✅\n\n• " + (user_list if user_list else "No users have completed engagement yet. ⏳")
     
     await message.reply(response, parse_mode="HTML")
-    logger.info(f"Admin {message.from_user.id} requested /adlist in chat {chat_id}.")
 
 async def cmd_notad(message: types.Message):
     """/notad: Finds users who haven't completed engagement."""
@@ -196,7 +203,6 @@ async def cmd_notad(message: types.Message):
         response = "All users completed engagement ✅"
         
     await message.reply(response, parse_mode="HTML")
-    logger.info(f"Admin {message.from_user.id} requested /notad in chat {chat_id}.")
 
 async def set_chat_lock_state(chat_id: int, bot: Bot, lock: bool):
     """Helper function to set chat permissions safely."""
@@ -223,38 +229,34 @@ async def set_chat_lock_state(chat_id: int, bot: Bot, lock: bool):
         return False
 
 async def cmd_lock(message: types.Message, bot: Bot):
-    """/lock: Locks the group chat (prevents all non-admin messages/media)."""
+    """/lock: Locks the group chat."""
     if await set_chat_lock_state(message.chat.id, bot, lock=True):
         await message.reply("Group chat locked 🔒. Only admins can send messages.")
-        logger.info(f"Admin {message.from_user.id} locked chat {message.chat.id} via /lock.")
 
 async def cmd_unlock(message: types.Message, bot: Bot):
-    """/unlock: Unlocks the group chat (allows all members to send messages/media)."""
+    """/unlock: Unlocks the group chat."""
     if await set_chat_lock_state(message.chat.id, bot, lock=False):
         await message.reply("Group chat unlocked 🔓.")
-        logger.info(f"Admin {message.from_user.id} unlocked chat {message.chat.id} via /unlock.")
 
 async def cmd_stop(message: types.Message):
-    """/stop: Sets the bot session to inactive (idle state) but does NOT lock the chat."""
+    """/stop: Sets the bot session to inactive (idle state)."""
     chat_id = message.chat.id
     
     clear_data(chat_id)
     session_active[chat_id] = False 
     
     await message.reply("Bot session stopped (IDLE). ⏸️")
-    logger.info(f"Admin {message.from_user.id} idled the bot session in chat {chat_id} via /stop.")
 
 async def cmd_detect(message: types.Message):
     """/detect: Announces the start of the engagement phase."""
     
     response = 'IF YOU HAVE COMPLETED ENGAGEMENT START SENDING "AD" ✅'
     await message.reply(response)
-    logger.info(f"Admin {message.from_user.id} started /detect (engagement phase) in chat {message.chat.id}.")
 
 # --- Handler for Non-Text Messages (Ensures 100% update coverage) ---
 
 async def handle_non_text_messages(message: types.Message):
-    """Handles non-text updates (photos, stickers, service messages) to prevent 'is not handled' warnings."""
+    """Handles non-text updates, deleting them if the chat is locked."""
     if not message.chat.type in [ChatType.GROUP, ChatType.SUPERGROUP]:
         return
 
@@ -263,16 +265,15 @@ async def handle_non_text_messages(message: types.Message):
     
     if chat_is_locked and message.from_user:
         try:
-            # Only delete if not an admin
             if not await is_admin(chat_id, message.from_user.id, message.bot):
                  await message.delete()
-        except Exception as e:
-            logger.warning(f"Could not delete non-text message in locked chat {chat_id}: {e}")
+        except Exception:
+            pass # Fail silently if we can't delete
 
 # --- Handler for User Messages (Link Sharing and AD/Done) ---
 
 async def handle_user_messages(message: types.Message):
-    """Handles link sharing and 'AD' messages from regular users."""
+    """Handles link sharing (silently) and 'AD' messages (with reply) from regular users."""
     
     if not message.from_user or not message.text:
         return
@@ -284,7 +285,7 @@ async def handle_user_messages(message: types.Message):
     participants_map, x_handles_map, completed_users_map, display_names_map, session_is_active, chat_is_locked = get_session_data(chat_id)
     is_user_admin = await is_admin(chat_id, user_id, message.bot)
 
-    # If the chat is locked, delete non-admin messages and stop processing
+    # 1. Chat Lock Filter
     if chat_is_locked and not is_user_admin:
         try:
             await message.delete()
@@ -292,15 +293,15 @@ async def handle_user_messages(message: types.Message):
             pass 
         return
         
-    # 1. Handle "AD/Done" messages
+    # 2. Handle "AD/Done" messages
     ad_keywords = {"ad", "done", "all done", "completed"}
     if user_text.lower() in ad_keywords:
         
         if not session_is_active:
+            await message.reply("The session is paused. ⏸️")
             return
 
         recorded_links = participants_map.get(user_id) 
-        
         if not recorded_links:
             await message.reply("Your link hasn't been recorded yet. Please send your X link first. ⚠️")
             return
@@ -319,14 +320,13 @@ async def handle_user_messages(message: types.Message):
         except Exception as e:
              logger.error(f"Failed to reply to AD/Done message in chat {chat_id}: {e}")
              
-        logger.info(f"AD/Done recorded for {user_id} in chat {chat_id}.")
         return
 
-    # 2. Handle Link Sharing
+    # 3. Handle Link Sharing (SILENTLY)
     if is_x_link(user_text):
         
         if not session_is_active:
-             await message.reply("The bot session is currently idle. Please wait for an admin to start a new session with /send. ⏸️")
+             await message.reply("The bot session is currently idle. ⏸️")
              return
             
         user_links = participants_map.setdefault(user_id, [])
@@ -341,7 +341,8 @@ async def handle_user_messages(message: types.Message):
         x_username = extract_x_username(user_text)
         
         if not x_username:
-            await message.reply("Could not extract an X username from the link. Please ensure it's a valid `x.com/<username>/status/...` link. 🚨")
+            # Still reply for a formatting error, as it's actionable feedback
+            await message.reply("Could not extract X username. Please ensure it's a valid link. 🚨")
             return
             
         # SILENT TRACKING: Store data without replying to the user
@@ -352,113 +353,123 @@ async def handle_user_messages(message: types.Message):
         completed_users_map[user_id] = False 
         display_names_map[user_id] = get_user_mention(message.from_user) 
 
-        # LOGGING is the only output for link submission
-        link_count = len(user_links)
-        logger.info(f"Link {link_count} received silently from {user_id} in chat {chat_id}. X Handle: {x_username}.")
+        # Only logging is the output for successful link submission
+        logger.info(f"Link {len(user_links)} received silently from {user_id} in chat {chat_id}. X Handle: {x_username}.")
 
 # --- Error Handling ---
 
 async def on_error(update: types.Update, exception: Exception):
-    """
-    Global error handler for all unhandled exceptions. 
-    Logs the error but prevents the Dispatcher from crashing.
-    """
+    """Global error handler."""
     logger.error(f"Unhandled exception during update processing: {exception}", exc_info=True)
 
-# --- Main Bot Setup ---
+# --- Bot and Webhook Setup ---
 
-def setup_bot_handlers(dp: Dispatcher, admin_filter: GroupAdminFilter):
-    """Registers all command and message handlers."""
-    
-    # Admin Commands
-    dp.message.register(cmd_send, Command("send"), admin_filter)
-    dp.message.register(cmd_list, Command("list"), admin_filter)
-    dp.message.register(cmd_xlist, Command("xlist"), admin_filter)
-    dp.message.register(cmd_adlist, Command("adlist"), admin_filter)
-    dp.message.register(cmd_notad, Command("notad"), admin_filter)
-    dp.message.register(cmd_refresh, Command("refresh"), admin_filter)
-    dp.message.register(cmd_lock, Command("lock"), admin_filter) 
-    dp.message.register(cmd_unlock, Command("unlock"), admin_filter) 
-    dp.message.register(cmd_stop, Command("stop"), admin_filter)
-    dp.message.register(cmd_detect, Command("detect"), admin_filter)
-    # /rs command is removed.
-    
-    # 1. Catch-all for TEXT messages (User activity)
-    dp.message.register(
-        handle_user_messages, 
-        F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), 
-        F.text
-    )
-    
-    # 2. Catch-all for NON-TEXT messages (Service, Photos, Stickers, etc.)
-    dp.message.register(
-        handle_non_text_messages,
-        F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
-        ~F.text 
-    )
-    
-    # Global Error Handler
-    dp.error.register(on_error)
-    logger.info("Bot handlers registered successfully.")
-    
-# --- Keep-Alive Web Server (FastAPI) ---
+# Initialize Bot and Dispatcher outside the main function
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML")
+)
+dp = Dispatcher()
 
-app = FastAPI(title="Bot Keep-Alive")
+# Register Handlers
+admin_filter = GroupAdminFilter()
 
-@app.head("/") 
+# Admin Commands
+dp.message.register(cmd_send, Command("send"), admin_filter)
+dp.message.register(cmd_list, Command("list"), admin_filter)
+dp.message.register(cmd_xlist, Command("xlist"), admin_filter)
+dp.message.register(cmd_adlist, Command("adlist"), admin_filter)
+dp.message.register(cmd_notad, Command("notad"), admin_filter)
+dp.message.register(cmd_refresh, Command("refresh"), admin_filter)
+dp.message.register(cmd_lock, Command("lock"), admin_filter) 
+dp.message.register(cmd_unlock, Command("unlock"), admin_filter) 
+dp.message.register(cmd_stop, Command("stop"), admin_filter)
+dp.message.register(cmd_detect, Command("detect"), admin_filter)
+
+# User Message Handlers
+dp.message.register(
+    handle_user_messages, 
+    F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}), 
+    F.text
+)
+dp.message.register(
+    handle_non_text_messages,
+    F.chat.type.in_({ChatType.GROUP, ChatType.SUPERGROUP}),
+    ~F.text 
+)
+dp.error.register(on_error)
+
+
+# --- FastAPI Application ---
+
+app = FastAPI(title="Webhook Listener")
+
+# 1. Health Check
 @app.get("/")
-def read_root():
-    """Simple health check endpoint for UptimeRobot/Render."""
-    return Response(status_code=200)
+def health_check():
+    """Simple health check endpoint for Render."""
+    return {"status": "ok", "message": "Bot Webhook Listener is running."}
 
-async def run_webserver():
-    """Runs the FastAPI server using uvicorn."""
-    port = int(os.getenv("PORT", 8080))
-    config = uvicorn.Config(
-        app, 
-        host="0.0.0.0", 
-        port=port, 
-        log_level="info",
-        lifespan="off"
-    )
-    server = uvicorn.Server(config)
-    logger.info(f"Starting Keep-Alive Webserver on port {port}...")
-    await server.serve()
-
-# --- Main Entry Point (Designed for Auto-Restart) ---
-
-async def main():
-    """The main entry point for the bot and webserver."""
-    
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode="HTML")
-    )
-    dp = Dispatcher()
-    
-    admin_filter = GroupAdminFilter()
-    setup_bot_handlers(dp, admin_filter)
-
-    web_task = asyncio.create_task(run_webserver())
-    
+# 2. Webhook Listener
+@app.post(WEBHOOK_PATH)
+async def bot_webhook(request: Request):
+    """Process updates sent by Telegram."""
     try:
-        logger.info("Starting AIOGram Bot Polling...")
-        await dp.start_polling(bot)
-    except Exception as e:
-        # If polling fails (e.g., due to TelegramConflictError)
-        logger.critical(f"FATAL POLLING ERROR: Polling loop crashed. Preparing for restart: {e}", exc_info=True)
-        web_task.cancel()
-        # Non-zero exit code (1) triggers the hosting service to restart
-        sys.exit(1)
+        # Get the JSON data from the request body
+        request_data = await request.json()
         
-    finally:
-        await bot.session.close()
+        # Convert the raw JSON to an aiogram Update object
+        update = Update.model_validate(request_data)
+
+        # Pass the update to the dispatcher
+        await dp.feed_update(bot, update)
+        
+        return Response(status_code=200)
+    except Exception as e:
+        logger.error(f"Error processing webhook update: {e}", exc_info=True)
+        # Always return 200 OK to Telegram to prevent retry loops
+        return Response(status_code=200) 
+
+# 3. Startup and Shutdown Events
+@app.on_event("startup")
+async def on_startup():
+    """Set the webhook URL on Telegram when the server starts."""
+    try:
+        logger.info(f"Setting webhook to: {WEBHOOK_URL}")
+        # Use HTTPS (Render provides this)
+        await bot.set_webhook(url=WEBHOOK_URL)
+        logger.info("Webhook set successfully.")
+    except Exception as e:
+        logger.critical(f"FATAL: Could not set webhook. Server exiting: {e}")
+        # Force exit to trigger Render restart if webhook setup fails
+        sys.exit(1)
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    """Clear the webhook on Telegram when the server shuts down."""
+    logger.info("Clearing webhook...")
+    await bot.delete_webhook()
+    await bot.session.close()
+    logger.info("Webhook cleared and session closed.")
+
+
+# --- Main Entry Point ---
 
 if __name__ == "__main__":
+    # Crucial change: Run the FastAPI app directly. 
+    # The bot's startup logic is now handled by @app.on_event("startup")
+    logger.info("Starting Webhook-based Bot Server...")
     try:
-        logger.info("Starting production AIOGram Bot...")
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot shutting down due to Keyboard Interrupt.")
+        uvicorn.run(
+            app, 
+            host=WEB_SERVER_HOST, 
+            port=WEB_SERVER_PORT, 
+            log_level="info",
+            # We must pass the lifespan events to handle webhook setup/teardown
+            # This makes the server much more reliable
+            lifespan="on"
+        )
     except Exception as e:
-        logger.critical(f"Bot failed to start or shut down unexpectedly: {e}")
+        logger.critical(f"FATAL UVICORN RUNTIME ERROR: Server crashed: {e}", exc_info=True)
+        # Non-zero exit code (1) triggers Render to restart
+        sys.exit(1)
